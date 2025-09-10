@@ -65,7 +65,7 @@ fn analyze_(
             // else, regular properties only
             debug!("Generating struct for {} (under {})", current, stack);
             // initial analysis of properties (we do not recurse here, we need to find members first)
-            if props.is_empty() && schema.x_kubernetes_preserve_unknown_fields.unwrap_or(false) {
+            if props.is_empty() {
                 warn!("not generating type {} - using map", current);
                 return Ok(());
             }
@@ -277,11 +277,9 @@ fn extract_container(
                     "IntOrString".into()
                 } else if value.x_kubernetes_preserve_unknown_fields == Some(true) {
                     "serde_json::Value".into()
-                } else if cfg.relaxed {
+                } else {
                     debug!("found empty object at {} key: {}", stack, key);
                     format!("{map_type}<String, serde_json::Value>")
-                } else {
-                    bail!("unknown empty dict type for {}", key)
                 }
             }
             x => bail!("unknown type {}", x),
@@ -334,6 +332,15 @@ fn resolve_additional_properties(
     cfg: &Config,
 ) -> Result<Option<String>, anyhow::Error> {
     debug!("got additional: {}", serde_json::to_string(&additional)?);
+
+    // Free-form object
+    // https://swagger.io/docs/specification/v3_0/data-models/data-types/#free-form-object
+    if let JSONSchemaPropsOrBool::Bool(s) = additional {
+        if *s {
+            return Ok(Some("serde_json::Value".into()));
+        }
+    }
+
     let JSONSchemaPropsOrBool::Schema(s) = additional else {
         return Ok(None);
     };
@@ -351,10 +358,10 @@ fn resolve_additional_properties(
         "" => {
             if s.x_kubernetes_int_or_string.is_some() {
                 Some("IntOrString".into())
-            } else if s.x_kubernetes_preserve_unknown_fields == Some(true) {
-                Some("serde_json::Value".into())
             } else {
-                bail!("unknown empty dict type for {}", key)
+                // Free-form object
+                // https://swagger.io/docs/specification/v3_0/data-models/data-types/#free-form-object
+                Some("serde_json::Value".into())
             }
         }
         "boolean" => Some("bool".to_string()),
@@ -481,7 +488,9 @@ fn extract_object_type(
     let mut dict_key = None;
     if let Some(additional) = &value.additional_properties {
         dict_key = resolve_additional_properties(additional, stack, key, cfg)?;
-    } else if value.properties.is_none() && value.x_kubernetes_preserve_unknown_fields.unwrap_or(false) {
+    } else if value.properties.is_none() {
+        // If neither additional properties or properties are defined it is a free-form object
+        // https://swagger.io/docs/specification/v3_0/data-models/data-types/#free-form-object
         dict_key = Some("serde_json::Value".into());
     }
     Ok(if let Some(dict) = dict_key {
@@ -686,6 +695,7 @@ type: object
         assert_eq!(server_selector.level, 1);
         let match_labels = &server_selector.members[0];
         assert_eq!(match_labels.name, "matchLabels");
+        // FIXME: This should ideally be a map of objects (due to type: object)
         assert_eq!(match_labels.type_, "BTreeMap<String, serde_json::Value>");
     }
 
@@ -1259,6 +1269,9 @@ type: object
         let schema_str = r#"
         properties:
           validations_info:
+            properties:
+              other:
+                type: string
             type: object
         type: object
 "#;
@@ -1401,5 +1414,67 @@ type: object
 
         let structs = analyze(schema, "Reference", Cfg::default()).unwrap().0;
         assert_eq!(structs[0].members[0].type_, "Option<Vec<ObjectReference>>");
+    }
+
+    #[test]
+    fn freeform_object_no_properties() {
+        init();
+
+        let schema_str = r#"
+        properties:
+          metadata:
+            type: object
+        type: object
+        "#;
+
+        let schema: JSONSchemaProps = serde_yaml::from_str(schema_str).unwrap();
+
+        let structs = analyze(schema, "FreeForm", Cfg::default()).unwrap().0;
+        assert_eq!(
+            structs[0].members[0].type_,
+            "Option<BTreeMap<String, serde_json::Value>>"
+        );
+    }
+
+    #[test]
+    fn freeform_object_additional_properties_true() {
+        init();
+
+        let schema_str = r#"
+        properties:
+          metadata:
+            additionalProperties: true
+            type: object
+        type: object
+        "#;
+
+        let schema: JSONSchemaProps = serde_yaml::from_str(schema_str).unwrap();
+
+        let structs = analyze(schema, "FreeForm", Cfg::default()).unwrap().0;
+        assert_eq!(
+            structs[0].members[0].type_,
+            "Option<BTreeMap<String, serde_json::Value>>"
+        );
+    }
+
+    #[test]
+    fn freeform_object_additional_properties_empty() {
+        init();
+
+        let schema_str = r#"
+        properties:
+          metadata:
+            additionalProperties: {}
+            type: object
+        type: object
+        "#;
+
+        let schema: JSONSchemaProps = serde_yaml::from_str(schema_str).unwrap();
+
+        let structs = analyze(schema, "FreeForm", Cfg::default()).unwrap().0;
+        assert_eq!(
+            structs[0].members[0].type_,
+            "Option<BTreeMap<String, serde_json::Value>>"
+        );
     }
 }
